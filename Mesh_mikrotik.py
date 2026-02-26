@@ -232,6 +232,132 @@ def make_wedge_polygon_on_square(half_side, boresight_deg, half_bw_deg=45.0):
 
 fig = go.Figure()
 
+# =============================
+# CLEAN ISO LABELS (NO VERTICAL TEXT)
+#  - one point per level
+#  - point реально на изолинии
+#  - подпись НЕ рисуем текстом (чтобы в 3D не "торчало")
+#  - информация есть в hover
+# =============================
+
+
+# 1) сначала гарантированно чистим старые label-трейсы (и старые "чёрные шары", если они были)
+def _is_old_label_trace(tr) -> bool:
+    nm = getattr(tr, "name", "") or ""
+    if isinstance(nm, str) and (nm.startswith("ISO_LABEL_") or nm.startswith("LBL_")):
+        return True
+    # если раньше были "чёрные шары" без имени — можно прибить по цвету
+    if tr.type == "scatter3d" and getattr(tr, "mode", "") == "markers":
+        mk = getattr(tr, "marker", None)
+        col = getattr(mk, "color", None) if mk else None
+        if isinstance(col, str) and col.startswith("rgba(0,0,0"):
+            return True
+    return False
+
+
+fig.data = tuple(tr for tr in fig.data if not _is_old_label_trace(tr))
+
+Z_BASE = 0.02  # чуть над поверхностью, чтобы не мерцало
+hs = float(half)
+
+lvl_style = {
+    -3.0: dict(color="rgba(255,220,120,1.0)"),
+    -6.0: dict(color="rgba(140,255,160,1.0)"),
+    -10.0: dict(color="rgba(120,180,255,1.0)"),
+}
+
+
+# зона, где у тебя размерная линия "24 км"
+# она у тебя на y_dim = hs + 0.9, значит верхнюю кромку (y≈hs) лучше избегать
+def pick_best_point(seg: np.ndarray) -> tuple[float, float]:
+    pts = np.asarray(seg, dtype=float)
+    x = pts[:, 0]
+    y = pts[:, 1]
+
+    r = np.sqrt(x * x + y * y)
+
+    # 1) хотим дальше от центра
+    score = 2.0 * r
+
+    # 2) избегаем верхней стороны квадрата (там "24 км")
+    # чем ближе y к +hs, тем сильнее штраф
+    score -= 6.0 * np.exp(-(((hs - y) / 1.2) ** 2))
+
+    # 3) избегаем краёв квадрата (чтобы не вылезало наружу)
+    edge_dist = np.minimum(
+        hs - np.abs(x), hs - np.abs(y)
+    )  # чем меньше, тем ближе к краю
+    score += 1.5 * edge_dist
+
+    # 4) чуть избегаем осей (чтобы не налезало на радиальные линии)
+    score += 0.3 * np.minimum(np.abs(x), np.abs(y))
+
+    idx = int(np.argmax(score))
+    return float(x[idx]), float(y[idx])
+
+
+# для каждого уровня: берём самый "длинный" сегмент и ставим одну метку
+for lev, segs in zip(cs.levels, cs.allsegs):
+    lev = float(lev)
+    if not segs:
+        continue
+
+    # выбираем самый длинный сегмент по длине дуги, а не по len()
+    best = None
+    best_len = 0.0
+    for seg in segs:
+        if seg is None or len(seg) < 20:
+            continue
+        Lseg = float(np.sum(np.sqrt(np.sum(np.diff(seg, axis=0) ** 2, axis=1))))
+        if Lseg > best_len:
+            best_len = Lseg
+            best = seg
+    if best is None:
+        continue
+
+    x0, y0 = pick_best_point(best)
+    r0 = float(np.sqrt(x0 * x0 + y0 * y0))
+
+    col = lvl_style.get(lev, dict(color="rgba(255,255,255,1.0)"))["color"]
+
+    # чуть выносим маркер наружу по радиусу (но НЕ текст!)
+    push = 0.45  # км
+    norm = max(1e-9, np.sqrt(x0 * x0 + y0 * y0))
+    x1 = x0 + push * (x0 / norm)
+    y1 = y0 + push * (y0 / norm)
+
+    # "RF marker": тонкое кольцо + точка (без чёрных шаров)
+    fig.add_trace(
+        go.Scatter3d(
+            x=[x1],
+            y=[y1],
+            z=[Z_BASE],
+            mode="markers",
+            marker=dict(
+                size=14,
+                symbol="circle-open",
+                color="rgba(255,255,255,0.9)",
+                line=dict(width=2, color="rgba(255,255,255,0.9)"),
+            ),
+            name=f"ISO_LABEL_{int(lev)}",
+            showlegend=False,
+            hovertemplate=f"{int(lev)} dB · {r0:.1f} км<extra></extra>",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=[x1],
+            y=[y1],
+            z=[Z_BASE],
+            mode="markers",
+            marker=dict(size=6, symbol="circle", color=col, line=dict(width=0)),
+            name=f"ISO_LABEL_{int(lev)}",
+            showlegend=False,
+            hovertemplate=f"{int(lev)} dB · {r0:.1f} км<extra></extra>",
+        )
+    )
+
 # =========================
 # PLOTLY PRO 3D (RF-simulator look)
 # Требует: X, Y, P_total_rel_dB, half, H (км), make_wedge_polygon_on_square(...)
@@ -260,6 +386,7 @@ fig.add_trace(
         hoverinfo="skip",
     )
 )
+
 
 # Контуры -3/-6/-10 dB "на земле" (z=0)
 # (в Plotly это делается встроенными контурами Surface)
@@ -558,6 +685,13 @@ fig.add_trace(
     )
 )
 
+# полностью отключаем hover у поверхности
+fig.update_traces(
+    hoverinfo="skip",
+    hovertemplate="<extra></extra>",
+    selector=dict(type="surface", name="Coverage"),
+)
+
 # =============================
 # ULTRA-CLEAN GRID (лёгкая RF сетка земли)
 # =============================
@@ -602,17 +736,6 @@ labels_per_level = 4
 fig_tmp, ax_tmp = plt.subplots(figsize=(4, 4))
 cs = ax_tmp.contour(Xg, Yg, dB_clip, levels=levels_lbl)
 plt.close(fig_tmp)
-
-# =============================
-# УДАЛЯЕМ старые подписи (если код перезапускается)
-# =============================
-fig.data = tuple(
-    tr
-    for tr in fig.data
-    if not (
-        hasattr(tr, "name") and isinstance(tr.name, str) and tr.name.startswith("LBL_")
-    )
-)
 
 # =============================
 # ПРОСТЫЕ ПОДПИСИ НА ОСНОВАНИИ ПИРАМИДЫ
@@ -673,88 +796,6 @@ fig.update_layout(
     margin=dict(l=0, r=0, t=50, b=0),
 )
 
-# =============================
-# RF planner toggle: TOP (читабельный) / 3D
-# вставить перед fig.write_html(...)
-# =============================
-
-cam_3d = dict(
-    eye=dict(x=1.6, y=1.6, z=1.1),
-    projection=dict(type="perspective"),
-    up=dict(x=0, y=0, z=1),
-)
-
-cam_top = dict(
-    eye=dict(x=0.0, y=0.0, z=2.6),
-    projection=dict(type="orthographic"),
-    up=dict(x=0, y=1, z=0),
-)
-
-# видимость трасс
-vis_3d = []
-vis_top = []
-
-for tr in fig.data:
-    nm = (getattr(tr, "name", "") or "").lower()
-
-    is_cov = "coverage" in nm
-    is_sq = ("footprint" in nm) or ("24×24" in nm) or ("24" in nm and "km" in nm)
-    is_meas = "measure" in nm
-    is_grid = "grid" in nm
-
-    is_beam = "beam" in nm
-    is_obj = "object" in nm
-
-    # 3D: всё показываем
-    vis_3d.append(True)
-
-    # TOP: только “аналитика”
-    vis_top.append(is_cov or is_sq or is_meas)
-
-
-# =============================
-# RF MODE: stable 3D + readable TOP (planner)
-# вставить перед fig.write_html(...)
-# Требует: ann_top (список annotations для TOP), fig уже собран
-# =============================
-
-# --- камеры (стабильные)
-cam_3d = dict(
-    eye=dict(x=1.55, y=1.55, z=1.05),
-    up=dict(x=0, y=0, z=1),
-    projection=dict(type="perspective"),
-    center=dict(x=0, y=0, z=0),
-)
-
-cam_top = dict(
-    # "чуть выше карты", чтобы занимала почти весь экран
-    eye=dict(x=0.0, y=0.0, z=0.85),
-    up=dict(x=0, y=1, z=0),
-    projection=dict(type="orthographic"),
-    center=dict(x=0, y=0, z=0),
-)
-
-# --- видимость трасс по именам
-vis_3d = []
-vis_top = []
-
-for tr in fig.data:
-    nm = (getattr(tr, "name", "") or "").lower()
-
-    is_cov = "coverage" in nm
-    is_fp = ("footprint" in nm) or ("24×24" in nm)
-    is_meas = "measure" in nm  # если ты оставила measure traces; если нет — ок
-    is_beam = "beam" in nm
-    is_obj = "object" in nm
-    is_grid = "grid" in nm
-
-    # 3D: всё, кроме лишней "карточной" сетки по желанию
-    vis_3d.append(True)
-
-    # TOP: только карта + квадрат (+measure если они трассами)
-    # пирамиды/объект/сетка скрываем — чтобы сверху было читабельно
-    vis_top.append(is_cov or is_fp or is_meas)
-
 
 # =============================
 # REAL ISO-LINES (-3/-6/-10 dB) from field, as Plotly lines
@@ -781,42 +822,33 @@ cs = ax_tmp.contour(Xs, Ys, Zs, levels=iso_levels)
 plt.close(fig_tmp)
 
 
-# cs.allsegs: список по уровням; каждый элемент — список сегментов (Nx2)
-for lev, segs in zip(cs.levels, cs.allsegs):
-    lev = float(lev)
-    st = iso_style.get(lev, dict(color="rgba(255,255,255,0.8)", width=5))
-
-    if not segs:
-        continue
-
-    # каждый сегмент рисуем отдельной линией (Plotly так проще)
-    for seg in segs:
-        if seg is None or len(seg) < 6:
-            continue
-
-        # seg: array(K,2) где [:,0]=x, [:,1]=y
-        xx = seg[:, 0]
-        yy = seg[:, 1]
-        zz = np.full_like(xx, 0.02)  # чуть над землёй, чтобы не мерцало
-
-        fig.add_trace(
-            go.Scatter3d(
-                x=xx,
-                y=yy,
-                z=zz,
-                mode="lines",
-                line=dict(width=st["width"], color=st["color"]),
-                showlegend=False,
-                name=f"Iso {int(lev)} dB",
-            )
-        )
-
-
 # =============================
-# Labels near isolines WITHOUT find_r_for_level
-# Требует: cs (matplotlib.contour), fig
+# CLEAN ISO LABELS (NO VERTICAL TEXT)
+#  - one point per level
+#  - point реально на изолинии
+#  - подпись НЕ рисуем текстом (чтобы в 3D не "торчало")
+#  - информация есть в hover
 # =============================
-Z_BASE = 0.02  # чтобы не z=0 в ноль с поверхностью
+
+
+# 1) сначала гарантированно чистим старые label-трейсы (и старые "чёрные шары", если они были)
+def _is_old_label_trace(tr) -> bool:
+    nm = getattr(tr, "name", "") or ""
+    if isinstance(nm, str) and (nm.startswith("ISO_LABEL_") or nm.startswith("LBL_")):
+        return True
+    # если раньше были "чёрные шары" без имени — можно прибить по цвету
+    if tr.type == "scatter3d" and getattr(tr, "mode", "") == "markers":
+        mk = getattr(tr, "marker", None)
+        col = getattr(mk, "color", None) if mk else None
+        if isinstance(col, str) and col.startswith("rgba(0,0,0"):
+            return True
+    return False
+
+
+fig.data = tuple(tr for tr in fig.data if not _is_old_label_trace(tr))
+
+Z_BASE = 0.02  # чуть над поверхностью, чтобы не мерцало
+hs = float(half)
 
 lvl_style = {
     -3.0: dict(color="rgba(255,220,120,1.0)"),
@@ -825,99 +857,34 @@ lvl_style = {
 }
 
 
-def pick_label_point(seg: np.ndarray) -> tuple[float, float]:
-    k = int(np.argmax(seg[:, 1]))  # верхняя точка изолинии
-    return float(seg[k, 0]), float(seg[k, 1])
+# зона, где у тебя размерная линия "24 км"
+# она у тебя на y_dim = hs + 0.9, значит верхнюю кромку (y≈hs) лучше избегать
+def pick_best_point(seg: np.ndarray) -> tuple[float, float]:
+    pts = np.asarray(seg, dtype=float)
+    x = pts[:, 0]
+    y = pts[:, 1]
 
+    r = np.sqrt(x * x + y * y)
 
-for lev, segs in zip(cs.levels, cs.allsegs):
-    lev = float(lev)
-    if not segs:
-        continue
+    # 1) хотим дальше от центра
+    score = 2.0 * r
 
-    # берём самый длинный сегмент уровня
-    best = None
-    best_len = 0.0
-    for seg in segs:
-        if seg is None or len(seg) < 20:
-            continue
-        Lseg = float(np.sum(np.sqrt(np.sum(np.diff(seg, axis=0) ** 2, axis=1))))
-        if Lseg > best_len:
-            best_len = Lseg
-            best = seg
-    if best is None:
-        continue
+    # 2) избегаем верхней стороны квадрата (там "24 км")
+    # чем ближе y к +hs, тем сильнее штраф
+    score -= 6.0 * np.exp(-(((hs - y) / 1.2) ** 2))
 
-    x0, y0 = pick_label_point(best)
-    r0 = (x0 * x0 + y0 * y0) ** 0.5  # расстояние от центра
+    # 3) избегаем краёв квадрата (чтобы не вылезало наружу)
+    edge_dist = np.minimum(
+        hs - np.abs(x), hs - np.abs(y)
+    )  # чем меньше, тем ближе к краю
+    score += 1.5 * edge_dist
 
-    col = lvl_style.get(lev, dict(color="rgba(255,255,255,1.0)"))["color"]
+    # 4) чуть избегаем осей (чтобы не налезало на радиальные линии)
+    score += 0.3 * np.minimum(np.abs(x), np.abs(y))
 
-    # небольшой сдвиг наружу от центра, чтобы текст стоял рядом с линией
-    scale = 1.06
-    x1, y1 = x0 * scale, y0 * scale
+    idx = int(np.argmax(score))
+    return float(x[idx]), float(y[idx])
 
-    # 1) halo (кольцо) — ВНИМАНИЕ: тут x0/y0, а не px/py
-    fig.add_trace(
-        go.Scatter3d(
-            x=[x0],
-            y=[y0],
-            z=[Z_BASE],
-            mode="markers",
-            marker=dict(
-                size=14,
-                symbol="circle-open",
-                color="rgba(255,255,255,0.85)",
-                line=dict(width=2, color="rgba(255,255,255,0.85)"),
-            ),
-            showlegend=False,
-            name=f"ISO_LABEL_{int(lev)}",
-            hoverinfo="skip",
-        )
-    )
-
-    # 2) core (точка)
-    fig.add_trace(
-        go.Scatter3d(
-            x=[x0],
-            y=[y0],
-            z=[Z_BASE],
-            mode="markers",
-            marker=dict(size=6, symbol="circle", color=col),
-            showlegend=False,
-            name=f"ISO_LABEL_{int(lev)}",
-            hovertemplate=f"{int(lev)} dB · {r0:.1f} км<extra></extra>",
-        )
-    )
-
-    # 3) “ножка” к подписи (в плоскости основания)
-    fig.add_trace(
-        go.Scatter3d(
-            x=[x0, x1],
-            y=[y0, y1],
-            z=[Z_BASE, Z_BASE],
-            mode="lines",
-            line=dict(width=4, color=col),
-            showlegend=False,
-            name=f"ISO_LABEL_{int(lev)}",
-            hoverinfo="skip",
-        )
-    )
-
-    # 4) подпись (тоже на основании)
-    fig.add_trace(
-        go.Scatter3d(
-            x=[x1],
-            y=[y1],
-            z=[Z_BASE],
-            mode="text",
-            text=[f"{int(lev)} dB · {r0:.1f} км"],
-            textfont=dict(size=18, color="white", family="Arial Black"),
-            showlegend=False,
-            name=f"ISO_LABEL_{int(lev)}",
-            hoverinfo="skip",
-        )
-    )
 
 # --- нормальный RF 3D старт (без TOP)
 fig.update_layout(
@@ -927,7 +894,7 @@ fig.update_layout(
     )
 )
 
-print("[INFO] RF MODE: normal 3D view")
+print("[INFO] RF MODE: normal 3D view!!")
 
 # --- сохранить HTML рядом со скриптом
 script_dir = os.path.dirname(os.path.abspath(__file__))
